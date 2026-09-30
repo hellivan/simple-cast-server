@@ -1,0 +1,14 @@
+# Example device configuration for simple-cast-server.
+#
+# Each entry describes a Chromecast / Google Nest Hub that can be started,
+# stopped and monitored via MQTT. "id" is used to build the device's MQTT
+# topics and its Home Assistant entity, so it must be unique and stable.
+
+- id: nesthub-1
+  target: https://immich-kiosk.example.com
+  ip: 10.0.0.4
+
+# - id: nesthub-2
+#   target: https://immich-kiosk.example.com/?webhook_id=nesthub-2
+#   ip: 10.0.0.5
+#   port: 8009 # optional, defaults to 8009
