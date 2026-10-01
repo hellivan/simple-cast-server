@@ -57,8 +57,8 @@ type conn struct {
 	// statusUpdates is a fan-out of unsolicited RECEIVER_STATUS messages.
 	statusUpdates chan *castMessage
 
-	closeOnce sync.Once
-	closed    chan struct{}
+	// closed is replaced on every (re)connect and closed on teardown.
+	closed chan struct{}
 }
 
 func newConn(host string, port int, log *slog.Logger) *conn {
@@ -75,13 +75,16 @@ func newConn(host string, port int, log *slog.Logger) *conn {
 		openChannels:  make(map[string]bool),
 		pending:       make(map[int]chan *castMessage),
 		statusUpdates: make(chan *castMessage, connectBacklog),
-		closed:        make(chan struct{}),
 	}
 }
 
 // connect dials the device and starts the background read and heartbeat
 // loops. It is safe to call connect again after close.
 func (c *conn) connect() error {
+	if c.isConnected() {
+		return nil
+	}
+
 	dialer := &net.Dialer{Timeout: dialTimeout}
 	tlsConn, err := tls.DialWithDialer(dialer, "tcp", fmt.Sprintf("%s:%d", c.host, c.port), &tls.Config{
 		// Chromecast devices use self-signed certificates.
@@ -91,14 +94,16 @@ func (c *conn) connect() error {
 		return fmt.Errorf("dial %s:%d: %w", c.host, c.port, err)
 	}
 
+	closed := make(chan struct{})
 	c.mu.Lock()
 	c.tlsConn = tlsConn
 	c.connected = true
-	c.closed = make(chan struct{})
+	c.closed = closed
+	c.openChannels = make(map[string]bool)
 	c.mu.Unlock()
 
-	go c.readLoop()
-	go c.heartbeatLoop()
+	go c.readLoop(tlsConn, closed)
+	go c.heartbeatLoop(tlsConn, closed)
 
 	return nil
 }
@@ -107,16 +112,28 @@ func (c *conn) connect() error {
 func (c *conn) close() error {
 	c.mu.Lock()
 	tlsConn := c.tlsConn
+	c.mu.Unlock()
+	if tlsConn == nil {
+		return nil
+	}
+	return c.teardown(tlsConn)
+}
+
+// teardown marks the connection as dead so the next call redials. It is a
+// no-op if tlsConn is no longer the current connection (e.g. a stale loop
+// from before a reconnect) or has already been torn down.
+func (c *conn) teardown(tlsConn *tls.Conn) error {
+	c.mu.Lock()
+	if c.tlsConn != tlsConn || !c.connected {
+		c.mu.Unlock()
+		return nil
+	}
 	c.connected = false
 	c.openChannels = make(map[string]bool)
+	close(c.closed)
 	c.mu.Unlock()
 
-	c.closeOnce.Do(func() { close(c.closed) })
-
-	if tlsConn != nil {
-		return tlsConn.Close()
-	}
-	return nil
+	return tlsConn.Close()
 }
 
 func (c *conn) isConnected() bool {
@@ -209,9 +226,11 @@ func (c *conn) sendRaw(destinationID, namespace string, payload any) error {
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(frame)))
 	if _, err := tlsConn.Write(lenBuf[:]); err != nil {
+		_ = c.teardown(tlsConn)
 		return fmt.Errorf("write frame length: %w", err)
 	}
 	if _, err := tlsConn.Write(frame); err != nil {
+		_ = c.teardown(tlsConn)
 		return fmt.Errorf("write frame payload: %w", err)
 	}
 	c.log.Debug("chromecast: sent message", "destination", destinationID, "namespace", namespace, "payload", string(data))
@@ -234,37 +253,33 @@ func (c *conn) forgetRequest(requestID int) {
 	c.mu.Unlock()
 }
 
-func (c *conn) heartbeatLoop() {
+func (c *conn) heartbeatLoop(tlsConn *tls.Conn, closed <-chan struct{}) {
 	ticker := time.NewTicker(heartbeatPeriod)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-c.closed:
+		case <-closed:
 			return
 		case <-ticker.C:
 			if err := c.sendRaw(platformID, nsHeartbeat, map[string]any{"type": "PING"}); err != nil {
 				c.log.Warn("chromecast: heartbeat failed", "error", err)
+				_ = c.teardown(tlsConn)
 				return
 			}
 		}
 	}
 }
 
-func (c *conn) readLoop() {
-	for {
-		c.mu.Lock()
-		tlsConn := c.tlsConn
-		c.mu.Unlock()
-		if tlsConn == nil {
-			return
-		}
+func (c *conn) readLoop(tlsConn *tls.Conn, closed <-chan struct{}) {
+	defer func() { _ = c.teardown(tlsConn) }()
 
+	for {
 		_ = tlsConn.SetReadDeadline(time.Now().Add(readIdleTimeout))
 
 		var lenBuf [4]byte
 		if _, err := io.ReadFull(tlsConn, lenBuf[:]); err != nil {
 			select {
-			case <-c.closed:
+			case <-closed:
 			default:
 				c.log.Debug("chromecast: read loop stopped", "error", err)
 			}

@@ -20,12 +20,13 @@ import (
 )
 
 const (
-	payloadOn    = "ON"
-	payloadOff   = "OFF"
-	payloadOnl   = "online"
-	payloadOffl  = "offline"
-	qosAtLeast   = 1
-	connectDelay = 2 * time.Second
+	payloadOn      = "ON"
+	payloadOff     = "OFF"
+	payloadOnl     = "online"
+	payloadOffl    = "offline"
+	qosAtLeast     = 1
+	connectDelay   = 2 * time.Second
+	publishTimeout = 5 * time.Second
 )
 
 // Options configures the MQTT bridge.
@@ -114,6 +115,9 @@ func (b *Bridge) Run(stop <-chan struct{}) error {
 		AddBroker(b.opts.Broker).
 		SetClientID(b.opts.ClientID).
 		SetAutoReconnect(true).
+		SetConnectRetry(true).
+		SetConnectRetryInterval(5*time.Second).
+		SetMaxReconnectInterval(30*time.Second).
 		SetOrderMatters(false).
 		SetWill(b.bridgeStatusTopic(), payloadOffl, qosAtLeast, true).
 		SetOnConnectHandler(b.onConnect).
@@ -128,10 +132,10 @@ func (b *Bridge) Run(stop <-chan struct{}) error {
 	}
 
 	b.client = paho.NewClient(connOpts)
-	token := b.client.Connect()
-	if token.Wait(); token.Error() != nil {
-		return fmt.Errorf("mqtt: connect: %w", token.Error())
-	}
+	// With ConnectRetry the client keeps retrying in the background until
+	// the broker is reachable, so a broker that starts after us isn't fatal.
+	b.log.Info("mqtt: connecting", "broker", b.opts.Broker)
+	b.client.Connect()
 
 	pollStop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -176,11 +180,14 @@ func (b *Bridge) onConnect(_ paho.Client) {
 }
 
 func (b *Bridge) publish(topic, payload string, retain bool) {
-	if b.client == nil || !b.client.IsConnected() {
+	if b.client == nil || !b.client.IsConnectionOpen() {
 		return
 	}
 	token := b.client.Publish(topic, qosAtLeast, retain, payload)
-	token.Wait()
+	if !token.WaitTimeout(publishTimeout) {
+		b.log.Error("mqtt: publish timed out", "topic", topic)
+		return
+	}
 	if err := token.Error(); err != nil {
 		b.log.Error("mqtt: publish failed", "topic", topic, "error", err)
 	}
